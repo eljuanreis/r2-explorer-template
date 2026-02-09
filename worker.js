@@ -1,37 +1,44 @@
 export default {
   async fetch(request, env, ctx) {
+    // Só permite GET
     if (request.method !== "GET") {
-      return new Response("Method not allowed", { status: 405 })
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    // const auth = request.headers.get("Authorization")
-    // if (auth !== "Bearer segredo123") {
-    //   return new Response("Unauthorized", { status: 401 })
-    // }
+    console.log("Request method:", request.method);
+    console.log("Request URL:", request.url);
 
-    const url = new URL(request.url)
-    const cache = caches.default
-    const key = url.pathname.replace(/^\/+/, "")
+    const url = new URL(request.url);
+    const cache = caches.default;
+    const key = url.pathname.replace(/^\/+/, ""); // caminho dentro do bucket
 
     if (!key) {
-      return new Response("Arquivo não informado", { status: 400 })
+      return new Response("Arquivo não informado", { status: 400 });
     }
 
-    // tenta cache primeiro
-    let cached = await cache.match(request)
+    // Normaliza a chave do cache (ignora headers como Authorization)
+    const cacheKey = new Request(url.pathname, { method: 'GET' });
+
+    // Tenta cache primeiro
+    let cached = await cache.match(cacheKey);
     if (cached) {
-      return cached
+      console.log("Achou no cache!");
+      return cached;
+    } else {
+      console.log("Sem bater no cache!");
     }
 
-    const object = await env.MY_BUCKET.get(key)
+    // Pega o arquivo do bucket
+    const object = await env.MY_BUCKET.get(key);
     if (!object) {
-      return new Response("Not found", { status: 404 })
+      console.log("Arquivo não encontrado no bucket:", key);
+      return new Response("Not found", { status: 404 });
     }
 
-    const etag = object.httpEtag || object.etag
+    const etag = object.httpEtag || object.etag;
 
-    // suporte a If-None-Match
-    const ifNoneMatch = request.headers.get("If-None-Match")
+    // Suporte a If-None-Match (cache do navegador)
+    const ifNoneMatch = request.headers.get("If-None-Match");
     if (etag && ifNoneMatch === etag) {
       return new Response(null, {
         status: 304,
@@ -39,18 +46,22 @@ export default {
           "ETag": etag,
           "Cache-Control": "public, max-age=600"
         }
-      })
+      });
     }
 
+    // Cria a resposta com cabeçalhos
     const response = new Response(object.body, {
       headers: {
         "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
         "Cache-Control": "public, max-age=600",
         "ETag": etag
       }
-    })
+    });
 
-    ctx.waitUntil(cache.put(request, response.clone()))
-    return response
+    // Salva no cache do Workers
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+
+    console.log("Arquivo retornado:", key);
+    return response;
   }
-}
+};
