@@ -4,10 +4,10 @@ export default {
       return new Response("Method not allowed", { status: 405 })
     }
 
-    const auth = request.headers.get("Authorization")
-    if (auth !== "Bearer segredo123") {
-      return new Response("Unauthorized", { status: 401 })
-    }
+    // const auth = request.headers.get("Authorization")
+    // if (auth !== "Bearer segredo123") {
+    //   return new Response("Unauthorized", { status: 401 })
+    // }
 
     const url = new URL(request.url)
     const cache = caches.default
