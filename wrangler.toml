@@ -1,0 +1,13 @@
+name = "r2-explorer-template"
+main = "worker.js"
+compatibility_date = "2025-10-08"
+
+[[r2_buckets]]
+binding = "MY_BUCKET"
+bucket_name = "r2-explorer-bucket"
+preview_bucket_name = "r2-explorer-bucket"
+# Apenas leitura — seu worker só faz GET
+
+[observability]
+enabled = true
+
