@@ -1,0 +1,13 @@
+{
+  "name": "r2-explorer-template",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker para leitura de arquivos do R2",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "4.56.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  }
+}
