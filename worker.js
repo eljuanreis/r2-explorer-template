@@ -1,64 +1,138 @@
 export default {
   async fetch(request, env, ctx) {
-    if (request.method !== "GET") {
-      return new Response("Method not allowed", { status: 405 });
+    const origin = request.headers.get("Origin");
+
+    // === CONFIGURAÇÃO DE CORS ===
+    const ALLOWED_ORIGINS = [
+      "https://seusite.com",
+      "*",
+    ];
+
+    const corsHeaders = {};
+    if (origin && ALLOWED_ORIGINS.includes(origin)) {
+      corsHeaders["Access-Control-Allow-Origin"] = origin;
+      corsHeaders["Vary"] = "Origin";
     }
 
-    console.log("Request method:", request.method);
-    console.log("Request URL:", request.url);
+    corsHeaders["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+    corsHeaders["Access-Control-Allow-Headers"] = "Range, Content-Type";
+    corsHeaders["Access-Control-Expose-Headers"] =
+      "Content-Length, Content-Range";
 
-    const url = new URL(request.url);
-    const cache = caches.default;
-    const key = url.pathname.replace(/^\/+/, ""); // caminho dentro do bucket
-
-    if (!key) {
-      return new Response("Arquivo não informado", { status: 400 });
-    }
-
-    // Cria uma URL completa para o cacheKey
-    const cacheKey = new Request(new URL(url.pathname, request.url).toString(), {
-      method: 'GET'
-    });
-
-    // Tenta cache primeiro
-    let cached = await cache.match(cacheKey);
-    if (cached) {
-      console.log("Achou no cache!");
-      return cached;
-    } else {
-      console.log("Sem bater no cache!");
-    }
-
-    const object = await env.MY_BUCKET.get(key);
-    if (!object) {
-      console.log("Arquivo não encontrado no bucket:", key);
-      return new Response("Not found", { status: 404 });
-    }
-
-    const etag = object.httpEtag || object.etag;
-    const ifNoneMatch = request.headers.get("If-None-Match");
-
-    if (etag && ifNoneMatch === etag) {
+    // === PREFLIGHT ===
+    if (request.method === "OPTIONS") {
+      console.log("[CORS] Preflight request");
       return new Response(null, {
-        status: 304,
-        headers: {
-          "ETag": etag,
-          "Cache-Control": "public, max-age=600"
-        }
+        status: 204,
+        headers: corsHeaders
       });
     }
 
-    const response = new Response(object.body, {
-      headers: {
-        "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
-        "Cache-Control": "public, max-age=600",
-        "ETag": etag
-      }
+    // === APENAS GET ===
+    if (request.method !== "GET") {
+      console.log("[BLOCK] Método não permitido:", request.method);
+      return new Response("Method not allowed", {
+        status: 405,
+        headers: corsHeaders
+      });
+    }
+
+    const url = new URL(request.url);
+    const cache = caches.default;
+    const key = url.pathname.replace(/^\/+/, "");
+
+    console.log("[REQUEST]", {
+      url: url.toString(),
+      key,
+      range: request.headers.get("Range") || "none"
     });
 
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    console.log("Arquivo retornado:", key);
+    if (!key) {
+      console.log("[ERROR] Arquivo não informado");
+      return new Response("Arquivo não informado", {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // === CACHE FIRST ===
+    const cached = await cache.match(request);
+    if (cached) {
+      console.log("[CACHE HIT]");
+      return new Response(cached.body, {
+        status: cached.status,
+        headers: mergeHeaders(cached.headers, corsHeaders)
+      });
+    }
+
+    console.log("[CACHE MISS] Buscando no bucket");
+
+    // === RANGE ===
+    const rangeHeader = request.headers.get("Range");
+
+    const object = await env.MY_BUCKET.get(key, {
+      range: rangeHeader
+        ? { header: rangeHeader }
+        : undefined
+    });
+
+    if (!object) {
+      console.log("[NOT FOUND]", key);
+      return new Response("Not found", {
+        status: 404,
+        headers: corsHeaders
+      });
+    }
+
+    // === HEADERS ===
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+
+    headers.set(
+      "Content-Type",
+      object.httpMetadata?.contentType || "application/octet-stream"
+    );
+
+    headers.set("Cache-Control", "public, max-age=600");
+
+    if (object.range) {
+      headers.set(
+        "Content-Range",
+        `bytes ${object.range.offset}-${object.range.end}/${object.size}`
+      );
+      headers.set("Accept-Ranges", "bytes");
+    }
+
+    // Aplica CORS
+    for (const [k, v] of Object.entries(corsHeaders)) {
+      headers.set(k, v);
+    }
+
+    const status = object.range ? 206 : 200;
+
+    const response = new Response(object.body, {
+      status,
+      headers
+    });
+
+    console.log("[RESPONSE]", {
+      status,
+      cached: false,
+      range: !!object.range
+    });
+
+    // === STORE CACHE ===
+    ctx.waitUntil(cache.put(request, response.clone()));
 
     return response;
   }
 };
+
+// Mescla headers do cache com CORS
+function mergeHeaders(original, extra) {
+  const headers = new Headers(original);
+  for (const [k, v] of Object.entries(extra)) {
+    headers.set(k, v);
+  }
+  return headers;
+}
