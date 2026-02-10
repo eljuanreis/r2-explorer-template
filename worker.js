@@ -1,30 +1,17 @@
 export default {
   async fetch(request, env, ctx) {
-    const origin = request.headers.get("Origin");
+    // ======================
+    // CORS (simples e correto)
+    // ======================
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Range, Content-Type",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range"
+    };
 
     // ======================
-    // CONFIGURAÇÃO DE CORS
-    // ======================
-    const ALLOWED_ORIGINS = [
-      "https://seusite.com",
-      "https://www.seusite.com",
-      "*",
-    ];
-
-    const corsHeaders = {};
-
-    if (origin && ALLOWED_ORIGINS.includes(origin)) {
-      corsHeaders["Access-Control-Allow-Origin"] = origin;
-      corsHeaders["Vary"] = "Origin";
-    }
-
-    corsHeaders["Access-Control-Allow-Methods"] = "GET, OPTIONS";
-    corsHeaders["Access-Control-Allow-Headers"] = "Range, Content-Type";
-    corsHeaders["Access-Control-Expose-Headers"] =
-      "Content-Length, Content-Range";
-
-    // ======================
-    // PREFLIGHT (CORS)
+    // PREFLIGHT
     // ======================
     if (request.method === "OPTIONS") {
       console.log("[CORS] Preflight");
@@ -35,7 +22,7 @@ export default {
     }
 
     // ======================
-    // MÉTODO PERMITIDO
+    // MÉTODO
     // ======================
     if (request.method !== "GET") {
       console.log("[BLOCK] Method:", request.method);
@@ -48,8 +35,12 @@ export default {
     const url = new URL(request.url);
     const cache = caches.default;
 
-    // Caminho do arquivo no bucket
-    const key = url.pathname.replace(/^\/+/, "");
+    // ======================
+    // KEY NO R2
+    // URL: /audios/arquivo.mp3
+    // R2:  arquivo.mp3
+    // ======================
+    const key = url.pathname.replace(/^\/audios\//, "");
 
     if (!key) {
       console.log("[ERROR] Arquivo não informado");
@@ -59,7 +50,6 @@ export default {
       });
     }
 
-    // Header Range (se existir)
     const rangeHeader = request.headers.get("Range");
 
     console.log("[REQUEST]", {
@@ -69,20 +59,31 @@ export default {
     });
 
     // ======================
-    // CACHE FIRST (APENAS SEM RANGE)
+    // VALIDA RANGE
+    // ======================
+    if (rangeHeader && !/^bytes=\d*-\d*$/.test(rangeHeader)) {
+      console.log("[INVALID RANGE]", rangeHeader);
+      return new Response("Invalid Range", {
+        status: 416,
+        headers: corsHeaders
+      });
+    }
+
+    // ======================
+    // CACHE FIRST (somente sem Range)
     // ======================
     if (!rangeHeader) {
       const cached = await cache.match(request);
       if (cached) {
         console.log("[CACHE HIT] Arquivo inteiro");
-        return addCorsToCached(cached, corsHeaders);
+        return addCors(cached, corsHeaders);
       }
     }
 
-    console.log("[CACHE MISS] Buscando no bucket");
+    console.log("[CACHE MISS] Buscando no R2");
 
     // ======================
-    // BUSCA NO BUCKET
+    // GET NO R2
     // ======================
     const object = await env.MY_BUCKET.get(key, {
       range: rangeHeader ? { header: rangeHeader } : undefined
@@ -97,7 +98,7 @@ export default {
     }
 
     // ======================
-    // HEADERS DA RESPOSTA
+    // HEADERS
     // ======================
     const headers = new Headers();
     object.writeHttpMetadata(headers);
@@ -107,19 +108,17 @@ export default {
       object.httpMetadata?.contentType || "application/octet-stream"
     );
 
-    // Cache por 10 minutos
     headers.set("Cache-Control", "public, max-age=600");
+    headers.set("Accept-Ranges", "bytes");
 
-    // Headers de Range
     if (object.range) {
       headers.set(
         "Content-Range",
         `bytes ${object.range.offset}-${object.range.end}/${object.size}`
       );
-      headers.set("Accept-Ranges", "bytes");
     }
 
-    // Aplica CORS
+    // CORS
     for (const [k, v] of Object.entries(corsHeaders)) {
       headers.set(k, v);
     }
@@ -133,13 +132,11 @@ export default {
 
     console.log("[RESPONSE]", {
       status,
-      cached: false,
       range: !!object.range
     });
 
     // ======================
-    // SALVA NO CACHE
-    // SOMENTE RESPOSTA 200
+    // CACHE STORE (apenas 200)
     // ======================
     if (!rangeHeader && status === 200) {
       ctx.waitUntil(cache.put(request, response.clone()));
@@ -151,9 +148,9 @@ export default {
 };
 
 // ======================
-// UTIL: adiciona CORS a resposta do cache
+// UTIL: adiciona CORS a cache hit
 // ======================
-function addCorsToCached(cached, corsHeaders) {
+function addCors(cached, corsHeaders) {
   const headers = new Headers(cached.headers);
   for (const [k, v] of Object.entries(corsHeaders)) {
     headers.set(k, v);
