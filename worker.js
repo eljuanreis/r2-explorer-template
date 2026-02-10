@@ -1,163 +1,125 @@
 export default {
   async fetch(request, env, ctx) {
-    // ======================
-    // CORS (simples e correto)
-    // ======================
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Range, Content-Type",
-      "Access-Control-Expose-Headers": "Content-Length, Content-Range"
-    };
+    const url = new URL(request.url)
 
-    // ======================
-    // PREFLIGHT
-    // ======================
+    /* ===============================
+       CONFIGURAÇÕES
+    =============================== */
+
+    const ALLOWED_ORIGINS = [
+      "https://seusite.com",
+      "http://localhost:3000"
+    ]
+
+    const CACHE_TTL = 600 // 10 minutos
+    const cache = caches.default
+
+    /* ===============================
+       CORS
+    =============================== */
+
+    const origin = request.headers.get("Origin")
+    const corsHeaders = {}
+
+    if (ALLOWED_ORIGINS.includes(origin)) {
+      corsHeaders["Access-Control-Allow-Origin"] = origin
+      corsHeaders["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+      corsHeaders["Access-Control-Allow-Headers"] = "Range"
+    }
+
     if (request.method === "OPTIONS") {
-      console.log("[CORS] Preflight");
       return new Response(null, {
         status: 204,
         headers: corsHeaders
-      });
+      })
     }
 
-    // ======================
-    // MÉTODO
-    // ======================
-    if (request.method !== "GET") {
-      console.log("[BLOCK] Method:", request.method);
-      return new Response("Method not allowed", {
-        status: 405,
-        headers: corsHeaders
-      });
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return new Response("Method Not Allowed", { status: 405 })
     }
 
-    const url = new URL(request.url);
-    const cache = caches.default;
+    /* ===============================
+       CACHE (SÓ PARA REQUEST SEM RANGE)
+    =============================== */
 
-    // ======================
-    // KEY NO R2
-    // URL: /audios/arquivo.mp3
-    // R2:  arquivo.mp3
-    // ======================
-    const key = url.pathname.replace(/^\/audios\//, "");
+    const hasRange = request.headers.has("Range")
 
-    if (!key) {
-      console.log("[ERROR] Arquivo não informado");
-      return new Response("Arquivo não informado", {
-        status: 400,
-        headers: corsHeaders
-      });
-    }
-
-    const rangeHeader = request.headers.get("Range");
-
-    console.log("[REQUEST]", {
-      url: url.toString(),
-      key,
-      range: rangeHeader || "none"
-    });
-
-    // ======================
-    // VALIDA RANGE
-    // ======================
-    if (rangeHeader && !/^bytes=\d*-\d*$/.test(rangeHeader)) {
-      console.log("[INVALID RANGE]", rangeHeader);
-      return new Response("Invalid Range", {
-        status: 416,
-        headers: corsHeaders
-      });
-    }
-
-    // ======================
-    // CACHE FIRST (somente sem Range)
-    // ======================
-    if (!rangeHeader) {
-      const cached = await cache.match(request);
+    if (!hasRange) {
+      const cached = await cache.match(request)
       if (cached) {
-        console.log("[CACHE HIT] Arquivo inteiro");
-        return addCors(cached, corsHeaders);
+        console.log("CACHE HIT:", url.pathname)
+        return cached
       }
     }
 
-    console.log("[CACHE MISS] Buscando no R2");
+    console.log("CACHE MISS:", url.pathname)
 
-    // ======================
-    // GET NO R2
-    // ======================
-    const object = await env.MY_BUCKET.get(key, {
-      range: rangeHeader ? { header: rangeHeader } : undefined
-    });
+    /* ===============================
+       KEY DO R2 (SEM / INICIAL)
+    =============================== */
 
-    if (!object) {
-      console.log("[NOT FOUND]", key);
-      return new Response("Not found", {
-        status: 404,
-        headers: corsHeaders
-      });
+    const key = url.pathname.replace(/^\/+/, "")
+    console.log("R2 KEY:", key)
+
+    /* ===============================
+       BUSCA NO R2
+    =============================== */
+
+    let object
+
+    try {
+      object = await env.MY_BUCKET.get(key, {
+        range: hasRange ? request.headers.get("Range") : undefined
+      })
+    } catch (err) {
+      console.error("R2 ERROR:", err)
+      return new Response("Internal error accessing storage", { status: 500 })
     }
 
-    // ======================
-    // HEADERS
-    // ======================
-    const headers = new Headers();
-    object.writeHttpMetadata(headers);
+    if (!object) {
+      console.log("R2 404:", key)
+      return new Response("Not found", { status: 404 })
+    }
 
-    headers.set(
-      "Content-Type",
-      object.httpMetadata?.contentType || "application/octet-stream"
-    );
+    /* ===============================
+       HEADERS DE RESPOSTA
+    =============================== */
 
-    headers.set("Cache-Control", "public, max-age=600");
-    headers.set("Accept-Ranges", "bytes");
+    const headers = new Headers()
+    headers.set("Content-Type", object.httpMetadata?.contentType || "application/octet-stream")
+    headers.set("Accept-Ranges", "bytes")
+
+    for (const [k, v] of Object.entries(corsHeaders)) {
+      headers.set(k, v)
+    }
 
     if (object.range) {
       headers.set(
         "Content-Range",
         `bytes ${object.range.offset}-${object.range.end}/${object.size}`
-      );
+      )
+      headers.set("Content-Length", object.range.length)
+    } else {
+      headers.set("Content-Length", object.size)
     }
 
-    // CORS
-    for (const [k, v] of Object.entries(corsHeaders)) {
-      headers.set(k, v);
+    const status = hasRange ? 206 : 200
+
+    const response = new Response(
+      request.method === "HEAD" ? null : object.body,
+      { status, headers }
+    )
+
+    /* ===============================
+       CACHE PUT (APENAS 200)
+    =============================== */
+
+    if (!hasRange && status === 200) {
+      headers.set("Cache-Control", `public, max-age=${CACHE_TTL}`)
+      ctx.waitUntil(cache.put(request, response.clone()))
+      console.log("CACHE STORE:", url.pathname)
     }
 
-    const status = object.range ? 206 : 200;
-
-    const response = new Response(object.body, {
-      status,
-      headers
-    });
-
-    console.log("[RESPONSE]", {
-      status,
-      range: !!object.range
-    });
-
-    // ======================
-    // CACHE STORE (apenas 200)
-    // ======================
-    if (!rangeHeader && status === 200) {
-      ctx.waitUntil(cache.put(request, response.clone()));
-      console.log("[CACHE STORE] Arquivo inteiro");
-    }
-
-    return response;
+    return response
   }
-};
-
-// ======================
-// UTIL: adiciona CORS a cache hit
-// ======================
-function addCors(cached, corsHeaders) {
-  const headers = new Headers(cached.headers);
-  for (const [k, v] of Object.entries(corsHeaders)) {
-    headers.set(k, v);
-  }
-
-  return new Response(cached.body, {
-    status: cached.status,
-    headers
-  });
 }
