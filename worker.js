@@ -7,7 +7,8 @@ export default {
     // ======================
     const ALLOWED_ORIGINS = [
       "https://seusite.com",
-      "https://www.seusite.com"
+      "https://www.seusite.com",
+      "*".
     ];
 
     const corsHeaders = {};
