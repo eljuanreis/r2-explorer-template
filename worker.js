@@ -2,13 +2,16 @@ export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin");
 
-    // === CONFIGURAÇÃO DE CORS ===
+    // ======================
+    // CONFIGURAÇÃO DE CORS
+    // ======================
     const ALLOWED_ORIGINS = [
       "https://seusite.com",
-      "*",
+      "https://www.seusite.com"
     ];
 
     const corsHeaders = {};
+
     if (origin && ALLOWED_ORIGINS.includes(origin)) {
       corsHeaders["Access-Control-Allow-Origin"] = origin;
       corsHeaders["Vary"] = "Origin";
@@ -19,18 +22,22 @@ export default {
     corsHeaders["Access-Control-Expose-Headers"] =
       "Content-Length, Content-Range";
 
-    // === PREFLIGHT ===
+    // ======================
+    // PREFLIGHT (CORS)
+    // ======================
     if (request.method === "OPTIONS") {
-      console.log("[CORS] Preflight request");
+      console.log("[CORS] Preflight");
       return new Response(null, {
         status: 204,
         headers: corsHeaders
       });
     }
 
-    // === APENAS GET ===
+    // ======================
+    // MÉTODO PERMITIDO
+    // ======================
     if (request.method !== "GET") {
-      console.log("[BLOCK] Método não permitido:", request.method);
+      console.log("[BLOCK] Method:", request.method);
       return new Response("Method not allowed", {
         status: 405,
         headers: corsHeaders
@@ -39,13 +46,9 @@ export default {
 
     const url = new URL(request.url);
     const cache = caches.default;
-    const key = url.pathname.replace(/^\/+/, "");
 
-    console.log("[REQUEST]", {
-      url: url.toString(),
-      key,
-      range: request.headers.get("Range") || "none"
-    });
+    // Caminho do arquivo no bucket
+    const key = url.pathname.replace(/^\/+/, "");
 
     if (!key) {
       console.log("[ERROR] Arquivo não informado");
@@ -55,25 +58,33 @@ export default {
       });
     }
 
-    // === CACHE FIRST ===
-    const cached = await cache.match(request);
-    if (cached) {
-      console.log("[CACHE HIT]");
-      return new Response(cached.body, {
-        status: cached.status,
-        headers: mergeHeaders(cached.headers, corsHeaders)
-      });
+    // Header Range (se existir)
+    const rangeHeader = request.headers.get("Range");
+
+    console.log("[REQUEST]", {
+      url: url.toString(),
+      key,
+      range: rangeHeader || "none"
+    });
+
+    // ======================
+    // CACHE FIRST (APENAS SEM RANGE)
+    // ======================
+    if (!rangeHeader) {
+      const cached = await cache.match(request);
+      if (cached) {
+        console.log("[CACHE HIT] Arquivo inteiro");
+        return addCorsToCached(cached, corsHeaders);
+      }
     }
 
     console.log("[CACHE MISS] Buscando no bucket");
 
-    // === RANGE ===
-    const rangeHeader = request.headers.get("Range");
-
+    // ======================
+    // BUSCA NO BUCKET
+    // ======================
     const object = await env.MY_BUCKET.get(key, {
-      range: rangeHeader
-        ? { header: rangeHeader }
-        : undefined
+      range: rangeHeader ? { header: rangeHeader } : undefined
     });
 
     if (!object) {
@@ -84,7 +95,9 @@ export default {
       });
     }
 
-    // === HEADERS ===
+    // ======================
+    // HEADERS DA RESPOSTA
+    // ======================
     const headers = new Headers();
     object.writeHttpMetadata(headers);
 
@@ -93,8 +106,10 @@ export default {
       object.httpMetadata?.contentType || "application/octet-stream"
     );
 
+    // Cache por 10 minutos
     headers.set("Cache-Control", "public, max-age=600");
 
+    // Headers de Range
     if (object.range) {
       headers.set(
         "Content-Range",
@@ -121,18 +136,30 @@ export default {
       range: !!object.range
     });
 
-    // === STORE CACHE ===
-    ctx.waitUntil(cache.put(request, response.clone()));
+    // ======================
+    // SALVA NO CACHE
+    // SOMENTE RESPOSTA 200
+    // ======================
+    if (!rangeHeader && status === 200) {
+      ctx.waitUntil(cache.put(request, response.clone()));
+      console.log("[CACHE STORE] Arquivo inteiro");
+    }
 
     return response;
   }
 };
 
-// Mescla headers do cache com CORS
-function mergeHeaders(original, extra) {
-  const headers = new Headers(original);
-  for (const [k, v] of Object.entries(extra)) {
+// ======================
+// UTIL: adiciona CORS a resposta do cache
+// ======================
+function addCorsToCached(cached, corsHeaders) {
+  const headers = new Headers(cached.headers);
+  for (const [k, v] of Object.entries(corsHeaders)) {
     headers.set(k, v);
   }
-  return headers;
+
+  return new Response(cached.body, {
+    status: cached.status,
+    headers
+  });
 }
