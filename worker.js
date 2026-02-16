@@ -1,64 +1,70 @@
 export default {
   async fetch(request, env, ctx) {
-    if (request.method !== "GET") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    console.log("Request method:", request.method);
-    console.log("Request URL:", request.url);
-
     const url = new URL(request.url);
+    const objectKey = url.pathname.slice(1);
+    
+    // Request do arquivo completo (ignora range)
+    const cacheKey = new Request(url.origin + url.pathname);
     const cache = caches.default;
-    const key = url.pathname.replace(/^\/+/, ""); // caminho dentro do bucket
-
-    if (!key) {
-      return new Response("Arquivo não informado", { status: 400 });
-    }
-
-    // Cria uma URL completa para o cacheKey
-    const cacheKey = new Request(new URL(url.pathname, request.url).toString(), {
-      method: 'GET'
-    });
-
-    // Tenta cache primeiro
+    
+    // Tenta pegar do cache
     let cached = await cache.match(cacheKey);
-    if (cached) {
-      console.log("Achou no cache!");
-      return cached;
-    } else {
-      console.log("Sem bater no cache!");
-    }
-
-    const object = await env.MY_BUCKET.get(key);
-    if (!object) {
-      console.log("Arquivo não encontrado no bucket:", key);
-      return new Response("Not found", { status: 404 });
-    }
-
-    const etag = object.httpEtag || object.etag;
-    const ifNoneMatch = request.headers.get("If-None-Match");
-
-    if (etag && ifNoneMatch === etag) {
-      return new Response(null, {
-        status: 304,
+    let fullBody, size, contentType, etag;
+    
+    if (!cached) {
+      // Busca do R2
+      const obj = await env.MY_BUCKET.get(objectKey);
+      if (!obj) return new Response('Not found', { status: 404 });
+      
+      fullBody = await obj.arrayBuffer();
+      size = fullBody.byteLength;
+      contentType = obj.httpMetadata?.contentType || 'audio/mpeg';
+      etag = obj.httpEtag;
+      
+      // Cacheia
+      ctx.waitUntil(cache.put(cacheKey, new Response(fullBody, {
         headers: {
-          "ETag": etag,
-          "Cache-Control": "public, max-age=600"
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=31536000',
+          'ETag': etag,
+        }
+      })));
+    }
+    
+    if (cached) {
+      fullBody = await cached.arrayBuffer();
+      size = fullBody.byteLength;
+      contentType = cached.headers.get('Content-Type');
+      etag = cached.headers.get('ETag');
+    }
+    
+    // Processa range
+    const range = request.headers.get('range');
+    if (range) {
+      const [start, end] = range.replace('bytes=', '').split('-').map(Number);
+      const finalEnd = end || size - 1;
+      const chunk = fullBody.slice(start, finalEnd + 1);
+      
+      return new Response(chunk, {
+        status: 206,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Range': `bytes ${start}-${finalEnd}/${size}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunk.byteLength,
+          'ETag': etag,
         }
       });
     }
-
-    const response = new Response(object.body, {
+    
+    // Arquivo completo
+    return new Response(fullBody, {
       headers: {
-        "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
-        "Cache-Control": "public, max-age=600",
-        "ETag": etag
+        'Content-Type': contentType,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': size,
+        'ETag': etag,
       }
     });
-
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    console.log("Arquivo retornado:", key);
-
-    return response;
   }
 };
