@@ -3,14 +3,31 @@ export default {
     const url = new URL(request.url);
     const objectKey = url.pathname.slice(1);
 
-    const cacheKey = new Request(url.origin + url.pathname);
+    // Cria cache key sem range (CDN cacheia arquivo completo)
+    const cacheUrl = new URL(request.url);
+    cacheUrl.search = ''; // Remove query strings
+    const cacheKey = new Request(cacheUrl.toString(), {
+      method: 'GET',
+      headers: new Headers() // Sem range header
+    });
+
     const cache = caches.default;
 
-    let cached = await cache.match(cacheKey);
+    // Tenta pegar arquivo completo do cache da CDN
+    let cachedResponse = await cache.match(cacheKey);
     let fullBody, size, contentType, etag;
     let cacheStatus = 'MISS';
 
-    if (!cached) {
+    if (cachedResponse) {
+      cacheStatus = 'HIT';
+      fullBody = await cachedResponse.arrayBuffer();
+      size = fullBody.byteLength;
+      contentType = cachedResponse.headers.get('Content-Type');
+      etag = cachedResponse.headers.get('ETag');
+
+      console.log('CDN Cache HIT', { objectKey, size });
+    } else {
+      // Busca do R2
       const obj = await env.MY_BUCKET.get(objectKey);
       if (!obj) return new Response('Not found', { status: 404 });
 
@@ -19,48 +36,51 @@ export default {
       contentType = obj.httpMetadata?.contentType || 'audio/mpeg';
       etag = obj.httpEtag;
 
-      ctx.waitUntil(cache.put(cacheKey, new Response(fullBody, {
+      console.log('CDN Cache MISS', { objectKey, size });
+
+      // Cacheia arquivo completo na CDN
+      const responseToCache = new Response(fullBody, {
         headers: {
           'Content-Type': contentType,
+          'Content-Length': size,
           'ETag': etag,
+          'Cache-Control': 'public, max-age=31536000, immutable',
         }
-      })));
+      });
 
-      console.log('Cache MISS', { cacheKey: cacheKey.url, objectKey, size, contentType });
-    } else {
-      cacheStatus = 'HIT';
-      fullBody = await cached.arrayBuffer();
-      size = fullBody.byteLength;
-      contentType = cached.headers.get('Content-Type');
-      etag = cached.headers.get('ETag');
-
-      console.log('Cache HIT', { cacheKey: cacheKey.url, objectKey, size });
+      ctx.waitUntil(cache.put(cacheKey, responseToCache));
     }
 
+    // Processa range do arquivo já em memória
     const range = request.headers.get('range');
     if (range) {
-      const [start, end] = range.replace('bytes=', '').split('-').map(Number);
-      const finalEnd = end || size - 1;
-      const chunk = fullBody.slice(start, finalEnd + 1);
+      const match = range.match(/bytes=(\d+)-(\d*)/);
+      if (!match) {
+        return new Response('Invalid range', { status: 416 });
+      }
 
-      console.log('Range request', { cacheStatus, range: `${start}-${finalEnd}`, chunkSize: chunk.byteLength, totalSize: size });
+      const start = parseInt(match[1], 10);
+      const end = match[2] ? parseInt(match[2], 10) : size - 1;
+      const chunk = fullBody.slice(start, end + 1);
+
+      console.log('Range from cache', { cacheStatus, range: `${start}-${end}`, size: chunk.byteLength });
 
       return new Response(chunk, {
         status: 206,
         headers: {
           'Content-Type': contentType,
-          'Content-Range': `bytes ${start}-${finalEnd}/${size}`,
+          'Content-Range': `bytes ${start}-${end}/${size}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': chunk.byteLength,
           'ETag': etag,
           'X-Cache-Status': cacheStatus,
           'Cache-Control': 'public, max-age=31536000, immutable',
-          'CDN-Cache-Control': 'public, max-age=31536000',
         }
       });
     }
 
-    console.log('Full file request', { cacheStatus, size });
+    // Request completo
+    console.log('Full file', { cacheStatus, size });
 
     return new Response(fullBody, {
       headers: {
@@ -70,7 +90,6 @@ export default {
         'ETag': etag,
         'X-Cache-Status': cacheStatus,
         'Cache-Control': 'public, max-age=31536000, immutable',
-        'CDN-Cache-Control': 'public, max-age=31536000',
       }
     });
   }
